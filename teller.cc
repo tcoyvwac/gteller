@@ -1,7 +1,11 @@
 #include <iostream>
 #include <vector>
-#include <math.h>
-#include <unistd.h>
+#define _USE_MATH_DEFINES
+#include <cmath>
+#include <optional>
+#include <algorithm>
+#include <array>
+#include <string>
 #include <thread>
 #include <atomic>
 #include <pcaudiolib/audio.h>
@@ -10,52 +14,40 @@ using namespace std;
 
 int main()
 {
-  audio_object* ao;
-
-  ao=create_audio_device_object(0, "teller", "");
+  audio_object* const ao=create_audio_device_object(0, "teller", "");
   if(!ao) {
     cerr<<"Unable to open audio file "<<endl;
     return 0;
   }
-  
-  int res = audio_object_open(ao, AUDIO_OBJECT_FORMAT_S16LE, 44100, 1);
-  if(res < 0) {
+
+  if(const auto res = audio_object_open(ao, AUDIO_OBJECT_FORMAT_S16LE, 44100, 1); res < 0) {
     cerr<<"Error opening audio: "<<audio_object_strerror(ao, res)<<endl;
   }
 
-  std::atomic<int64_t> counter = 0;
-  auto player = [&]() {
-    vector<int16_t> data;
-    int ourcounter=0;
-    data.reserve(44100);
-    while(counter >= 0) {
+  std::optional<std::atomic<int64_t>> counter = 0;
+  const auto player = [&, data = vector<int16_t>(44100), ourcounter = int64_t{}]() mutable {
+    while(counter) {
       data.clear();
-      if(ourcounter < counter) {
-        for(int n=0; n < 250; ++n) {
-          int16_t val = 20000 * sin((n/44100.0) * 500 * 2 * M_PI);
-          data.push_back(val);
-        }
-        ourcounter++;
-        if(counter - ourcounter > 1000)
-          ourcounter = counter;
-      }
-      else {
-        for(int n=0; n < 150; ++n) {
-          data.push_back(0);
-        }
-      }
-      
-      audio_object_write(ao, &data[0], data.size() * sizeof(decltype(data)::value_type));
-      // audio_object_flush(ao);
+      constexpr auto gen_sinewave_t = [data = std::array<int16_t, 250>{}]() mutable {
+        std::generate(std::begin(data), std::end(data), [n=0] () mutable { return 20000 * sin((n++/44100.0) * 500 * 2 * M_PI); });
+        return data;
+      };
+      const auto gen_waveform = [&](auto generator) {
+        const auto waveform = generator();    // A callable which returns a [sinewave, nullwave] data-array.
+        std::move(std::begin(waveform), std::end(waveform), std::back_inserter(data));
+        return data;
+      };
+      const auto adjusted_counter = [&] { return ((*counter - (ourcounter++)) > 1000) ? int64_t{*counter} : ourcounter;};
+      std::tie(data, ourcounter) = (ourcounter < counter)
+                                   ? std::tuple{ gen_waveform(gen_sinewave_t), adjusted_counter()}
+                                   : std::tuple{ gen_waveform([]{ return std::array<int16_t, 150>{}; }), ourcounter};
+      audio_object_write(ao, std::data(data), std::size(data) * sizeof(decltype(data)::value_type));
     }
   };
 
   std::thread athread(player);
-  string line;
-  while(getline(cin, line)) {
-    counter++;
-  }
-  counter = -1;
+  for(string line; getline(cin, line); (*counter)++);
+  counter = nullopt;
   athread.join();
-  sleep(1);
+  std::this_thread::sleep_for(1s);
 }
